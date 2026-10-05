@@ -1,0 +1,63 @@
+PATH
+  remote: .
+  specs:
+    roda (3.108.0)
+      rack
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    date (3.5.1)
+    drb (2.2.3)
+    erubi (1.13.1)
+    json (3.0.2)
+    logger (1.7.0)
+    mail (2.9.1)
+      logger
+      mini_mime (>= 0.1.1)
+      net-imap
+      net-pop
+      net-smtp
+    mini_mime (1.1.5)
+    minitest (6.0.6)
+      drb (~> 2.0)
+      prism (~> 1.5)
+    minitest-global_expectations (1.0.2)
+      minitest (> 5)
+    minitest-hooks (1.5.4)
+      minitest (> 5.3)
+    net-imap (0.6.7)
+      date
+      net-protocol
+    net-pop (0.1.2)
+      net-protocol
+    net-protocol (0.4.0)
+      timeout
+    net-smtp (0.5.2)
+      net-protocol
+    prism (1.9.0)
+    rack (3.2.7)
+    rack_csrf (2.7.0)
+      rack (>= 1.1.0)
+    rake (13.4.2)
+    tilt (2.9.0)
+    timeout (0.6.1)
+
+PLATFORMS
+  ruby
+  x86_64-linux-gnu
+
+DEPENDENCIES
+  erubi
+  json
+  mail
+  minitest (>= 5.7.0)
+  minitest-global_expectations
+  minitest-hooks
+  rack_csrf
+  rake
+  roda!
+  tilt
+
+BUNDLED WITH
+   2.6.7
