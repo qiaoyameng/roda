@@ -225,6 +225,32 @@ class Roda
     # data (string keys), to semitrusted data that can be used internally (trusted in the sense that
     # the expected types are used, not that you trust the values).
     #
+    # When using +convert!+ or +convert_each!+, the plugin keeps a record of which
+    # parameters are consumed by the conversion methods called inside the block.
+    # This allows checking at the end of the conversion scope whether all submitted
+    # parameters were actually used, which is useful when the parameters read depend
+    # on a submitted value (such as an +action+ parameter), and a fixed whitelist of
+    # allowed parameters cannot express which parameters are valid for the request.
+    # You can use the <tt>:unknown => :raise</tt> option to have an Error raised at
+    # the end of the conversion scope if there are leaf parameters that were not
+    # consumed:
+    #
+    #   converted_params = typecast_params.convert!(unknown: :raise) do |tp|
+    #     case tp.str!('action')
+    #     when 'create'
+    #       tp.str!('name')
+    #     when 'update'
+    #       tp.pos_int!('id')
+    #     end
+    #   end
+    #
+    # With this example, if +action+ is +create+, submitting an +id+ parameter
+    # results in an Error, since the +create+ branch does not consume it.
+    # Alternatively, you can use TypecastParams::Params#unconsumed_params to get
+    # the key paths of the unconsumed leaf parameters without raising.
+    # TypecastParams::Params#ignore can be used inside the block to explicitly
+    # mark a subtree of parameters as consumed.
+    #
     # Note that if there are multiple conversion errors raised inside a +convert!+ or +convert_each!+ 
     # block, they are recorded and a single TypecastParams::Error instance is raised after
     # processing the block.  TypecastParams::Error#param_names can be called on the exception to
@@ -358,6 +384,8 @@ class Roda
         # this will be the conversion method symbol.  If this error was caused
         # because a value was missing, then it will be +:missing+.  If this error was
         # caused because a value was not the correct type, then it will be +:invalid_type+.
+        # If this error was caused by an unconsumed parameter when using the
+        # <tt>:unknown => :raise</tt> option, then it will be +:unknown+.
         attr_accessor :reason
 
         # The likely parameter name where the contents were not expected.  This is
@@ -613,16 +641,25 @@ class Roda
 
         # If key is a String Return whether the key is present in the object,
         def present?(key)
-          case key
-          when String
-            !any(key).nil?
-          when Array
-            key.all? do |k|
-              raise ProgrammerError, "non-String element in array argument passed to present?: #{k.inspect}" unless k.is_a?(String)
-              !any(k).nil?
+          # Checking for the presence of a key is only a probe, and should not
+          # be recorded as consuming the parameter in the current conversion scope.
+          consumed = @consumed
+          @consumed = nil
+
+          begin
+            case key
+            when String
+              !any(key).nil?
+            when Array
+              key.all? do |k|
+                raise ProgrammerError, "non-String element in array argument passed to present?: #{k.inspect}" unless k.is_a?(String)
+                !any(k).nil?
+              end
+            else
+              raise ProgrammerError, "unexpected argument passed to present?: #{key.inspect}"
             end
-          else
-            raise ProgrammerError, "unexpected argument passed to present?: #{key.inspect}"
+          ensure
+            @consumed = consumed
           end
         end
 
@@ -654,7 +691,7 @@ class Roda
           end
 
           @subs[key] = sub
-          sub.sub_capture(@capture, @symbolize, @skip_missing)
+          sub.sub_capture(@capture, @symbolize, @skip_missing, @consumed)
           sub
         end
 
@@ -662,6 +699,50 @@ class Roda
         # calls the block to return the value, or returns nil if there is no block given.
         def fetch(key)
           send(:[], key){return(yield if defined?(yield))}
+        end
+
+        # Mark the parameters with the given keys as consumed in the current
+        # conversion scope, including all parameters nested below them.  This
+        # can be used inside a convert!/convert_each! block to explicitly ignore
+        # a subtree of the parameters, so it will not be reported by
+        # #unconsumed_params or rejected when using the <tt>:unknown => :raise</tt>
+        # option.  Marking a key as consumed also covers empty arrays and hashes
+        # below the key, which have no leaf parameters of their own.
+        #
+        # Has no effect unless called inside a convert!/convert_each! block.
+        def ignore(*keys)
+          keys.each do |key|
+            unless key.is_a?(String) || key.is_a?(Integer)
+              raise ProgrammerError, "unexpected argument passed to ignore: #{key.inspect}"
+            end
+
+            consume!(key)
+          end
+          nil
+        end
+
+        # Return an array of key paths for the leaf parameters that have not been
+        # consumed in the current conversion scope.  Each key path is an array of
+        # the string keys and integer indexes used to access the leaf parameter in
+        # the submitted parameters, and is suitable for splatting to +dig+.
+        #
+        # When called inside a convert!/convert_each! block, this only reports
+        # unconsumed leaves below the receiver, so nested conversion scopes can
+        # check only their own range.  When called on the object convert! was
+        # called on after the convert! block has finished, this reports the
+        # unconsumed leaves recorded when the conversion scope ended.  Returns
+        # nil if no conversion scope has been run.
+        #
+        # Accessing a hash or array (via #[] or #fetch) does not consume the
+        # parameters nested below it, and neither does checking #present?.
+        # Parameters whose conversion raised an error are considered consumed,
+        # so they are not reported again as unknown parameters.
+        def unconsumed_params
+          if @consumed
+            _unconsumed_at(nil)
+          else
+            @last_unconsumed
+          end
         end
 
         # Captures conversions inside the given block, and returns a hash of all conversions,
@@ -674,14 +755,20 @@ class Roda
         #                  present in the params.
         # :symbolize :: Convert any string keys in the resulting hash and for any
         #               conversions below
+        # :unknown :: If set to :raise, raise an Error after the block if the
+        #             conversion scope did not consume all leaf parameters
+        #             below the given keys.  See #unconsumed_params for what
+        #             counts as consuming a parameter.
         def convert!(keys=nil, opts=OPTS)
           if keys.is_a?(Hash)
             opts = keys
             keys = nil
           end
 
-          _capture!(:nested_params, opts) do
-            if sub = subkey(Array(keys).dup, opts.fetch(:raise, true))
+          keys = Array(keys).dup
+
+          _capture!(:nested_params, opts, keys) do
+            if sub = subkey(keys.dup, opts.fetch(:raise, true))
               yield sub
             end
           end
@@ -844,11 +931,12 @@ class Roda
         end
 
         # Inherit given capturing and symbolize setting from parent object.
-        def sub_capture(capture, symbolize, skip_missing)
+        def sub_capture(capture, symbolize, skip_missing, consumed=nil)
           if @capture = capture
             @symbolize = symbolize
             @skip_missing = skip_missing
             @params = @obj.class.new
+            @consumed = consumed
           end
         end
         
@@ -861,7 +949,7 @@ class Roda
         undef symbolize
 
         # Internals of convert! and convert_each!.
-        def _capture!(ret, opts)
+        def _capture!(ret, opts, subpath=nil)
           previous_symbolize = @symbolize
           previous_skip_missing = @skip_missing
 
@@ -870,6 +958,7 @@ class Roda
             @subs.clear if @subs
             capturing_started = true
             cap = @capture = []
+            @consumed = []
           end
 
           if opts.has_key?(:symbolize)
@@ -883,6 +972,17 @@ class Roda
             v = yield
           rescue Error => e
             cap << e unless cap.last == e
+          end
+
+          if @consumed && opts[:unknown] == :raise
+            unknown = _unconsumed_at(subpath)
+            unknown.each do |path|
+              cap << _unknown_error(path)
+            end
+
+            # Consider reported parameters consumed, so an outer conversion
+            # scope checking for unknown parameters does not report them again.
+            @consumed.concat(unknown)
           end
 
           if capturing_started
@@ -902,6 +1002,12 @@ class Roda
           @nested_params = nil
 
           if capturing_started
+            # Record the unconsumed leaf parameters for the conversion scope,
+            # so they can be reported after the scope ends, and stop tracking
+            # consumption.
+            @last_unconsumed = _unconsumed_at(nil) if @consumed
+            @consumed = nil
+
             # Unset capturing if capturing was already started.
             @capture = nil
           else
@@ -982,6 +1088,13 @@ class Roda
             e = Error.create(keys(key), reason, e)
 
             if @capture
+              # Parameters with conversion errors keep their original
+              # conversion error, and should not be reported again as
+              # unknown parameters.
+              if @consumed && !(ks = keys(key)).empty?
+                @consumed << ks
+              end
+
               @capture << e
               raise e if do_raise
               nil
@@ -1051,6 +1164,8 @@ class Roda
         # Get the value of +key+ for the object, and convert it to the expected type using +meth+.
         # If the value either before or after conversion is nil, return the +default+ value.
         def process(meth, key, default, type)
+          consume!(key)
+
           orig_v = v = param_value(key)
 
           if v.nil?
@@ -1081,6 +1196,94 @@ class Roda
         # Get the value for the given key in the object.
         def param_value(key)
           @obj[key]
+        end
+
+        # Record the parameter at +key+ (relative to the current nesting) as
+        # consumed in the current conversion scope, if consumption is being
+        # tracked.
+        def consume!(key)
+          @consumed << (Array(@nesting) + [key]) if @consumed
+          nil
+        end
+
+        # Whether the given key path has been consumed in the current
+        # conversion scope, either directly or by consuming or ignoring a
+        # parameter higher in the hierarchy.
+        def consumed_path?(path)
+          @consumed.any? do |consumed|
+            consumed.length <= path.length && path[0, consumed.length] == consumed
+          end
+        end
+
+        # An array of the key paths for all leaf parameters below the given
+        # subpath (relative to the current nesting) that have not been consumed
+        # in the current conversion scope.
+        def _unconsumed_at(subpath)
+          obj = @obj
+          path = Array(@nesting)
+
+          Array(subpath).each do |key|
+            valid = case obj
+            when Hash
+              obj.has_key?(key)
+            when Array
+              key.is_a?(Integer) && key >= 0 && key < obj.length
+            else
+              false
+            end
+            return [] unless valid
+
+            obj = obj[key]
+            path = path + [key]
+          end
+
+          _unconsumed_in(obj, path)
+        end
+
+        # An array of the key paths for all leaf parameters in the given object
+        # that have not been consumed in the current conversion scope.  Empty
+        # arrays and hashes have no leaf parameters of their own, so the
+        # container itself is treated as the leaf.
+        def _unconsumed_in(obj, path)
+          case obj
+          when Hash
+            if obj.empty?
+              path.empty? || consumed_path?(path) ? [] : [path]
+            else
+              unconsumed = []
+              obj.each do |key, v|
+                unconsumed.concat(_unconsumed_in(v, path + [key]))
+              end
+              unconsumed
+            end
+          when Array
+            if obj.empty?
+              path.empty? || consumed_path?(path) ? [] : [path]
+            else
+              unconsumed = []
+              obj.each_with_index do |v, i|
+                unconsumed.concat(_unconsumed_in(v, path + [i]))
+              end
+              unconsumed
+            end
+          else
+            consumed_path?(path) ? [] : [path]
+          end
+        end
+
+        # An Error for an unknown parameter at the given key path, using the
+        # string keys and integer indexes from the submitted parameters.
+        def _unknown_error(path)
+          first, *rest = path
+          name = String(first).dup
+          rest.each do |param|
+            name << "[#{param}]"
+          end
+
+          e = Error.new("unknown parameter: #{name}")
+          e.keys = path
+          e.reason = :unknown
+          e
         end
 
         # Helper for conversion methods where '' should be considered nil,

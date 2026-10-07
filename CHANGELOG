@@ -1,5 +1,7 @@
 === master
 
+* Add consumption tracking to typecast_params convert!/convert_each!, with :unknown=>:raise option, and Params#unconsumed_params and Params#ignore methods
+
 * Persist keys set in Roda.opts to class instance variables, add attr_reader methods for much faster access (jeremyevans)
 
 * Add rescue_classes keyword argument to invalid_request_body plugin (jeremyevans)

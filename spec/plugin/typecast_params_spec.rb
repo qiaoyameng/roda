@@ -1655,3 +1655,276 @@ describe "typecast_params plugin with strip: :all option" do
     @tp.call("a[]=1").any('a').must_equal ["1"]
   end
 end
+
+describe "typecast_params plugin consumption tracking" do
+  def tp(arg='a=1&b[]=2&b[]=3&c[d]=4&c[e]=5')
+    @tp.call(arg)
+  end
+
+  def error
+    yield
+  rescue @tp_error => e
+    e
+  end
+
+  before do
+    res = nil
+    app(:typecast_params) do |r|
+      if r.env['rack.params']
+        r.define_singleton_method(:params){r.env['rack.params']}
+      end
+      res = typecast_params
+      nil
+    end
+
+    @tp = lambda do |params|
+      if params.is_a?(Hash)
+        req('rack.params'=>params)
+      else
+        req('QUERY_STRING'=>params, 'rack.input'=>rack_input)
+      end
+      res
+    end
+
+    @tp_error = Roda::RodaPlugins::TypecastParams::Error
+  end
+
+  it "#convert! with :unknown=>:raise should raise for unconsumed leaf parameters" do
+    t = tp()
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.int!('a')
+        ptp.array!(:int, 'b')
+      end
+    end
+    e.must_be_kind_of @tp_error
+    e.reason.must_equal :unknown
+    e.keys.must_equal ['c', 'd']
+    e.message.must_equal 'unknown parameter: c[d]'
+    e.param_names.must_equal ['c[d]', 'c[e]']
+    e.all_errors.map{|err| err.reason}.must_equal [:unknown, :unknown]
+  end
+
+  it "#convert! with :unknown=>:raise should return converted params when all leaves are consumed" do
+    t = tp('a=1&c[d]=4')
+    t.convert!(unknown: :raise) do |ptp|
+      ptp.int!('a')
+      ptp.convert!('c'){|stp| stp.int!('d')}
+    end.must_equal('a'=>1, 'c'=>{'d'=>4})
+  end
+
+  it "should not consider accessing a container as consuming its entries" do
+    t = tp('a=1&c[d]=4')
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.int!('a')
+        ptp['c']
+      end
+    end
+    e.param_names.must_equal ['c[d]']
+
+    t = tp('a=1&c[d]=4')
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.int!('a')
+        ptp.convert!('c'){}
+      end
+    end
+    e.param_names.must_equal ['c[d]']
+
+    t = tp('a=1&c[d]=4')
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.int!('a')
+        ptp.fetch('c')
+      end
+    end
+    e.param_names.must_equal ['c[d]']
+  end
+
+  it "should not consider present? checks as consuming" do
+    t = tp('a=1')
+    t.convert!(unknown: :raise) do |ptp|
+      ptp.int!('a') if ptp.present?('a')
+    end.must_equal('a'=>1)
+
+    t = tp('a=1&b=2')
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.int!('a')
+        ptp.present?('b')
+        ptp.present?(%w'a b')
+      end
+    end
+    e.param_names.must_equal ['b']
+  end
+
+  it "should keep the original conversion error and not report the parameter as unknown" do
+    t = tp('a=xyz&b=2')
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.pos_int!('a')
+      end
+    end
+    e.reason.must_equal :invalid_value
+    e.keys.must_equal ['a']
+    e.all_errors.map{|err| err.reason}.must_equal [:invalid_value, :unknown]
+    e.param_names.must_equal ['a', 'b']
+  end
+
+  it "#ignore should mark a subtree as consumed, including empty containers" do
+    t = tp('a'=>'1', 'b'=>{'c'=>'2', 'd'=>{'e'=>'3'}}, 'f'=>{}, 'g'=>[])
+    t.convert!(unknown: :raise) do |ptp|
+      ptp.int!('a')
+      ptp.ignore('b', 'f', 'g')
+    end.must_equal('a'=>1)
+
+    t = tp('a'=>'1', 'f'=>{}, 'g'=>[])
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.int!('a')
+      end
+    end
+    e.param_names.must_equal ['f', 'g']
+
+    lambda{tp().convert!{|ptp| ptp.ignore(:a)}}.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError
+  end
+
+  it "should share consumption tracking across nested convert!, convert_each!, and dig" do
+    t = tp('a'=>{'b'=>'1', 'c'=>'2'}, 'd'=>[{'e'=>'3', 'f'=>'4'}], 'g'=>{'h'=>'5', 'i'=>'6'})
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.convert!('a'){|stp| stp.pos_int!('b')}
+        ptp.convert!('d'){|dtp| dtp.convert_each!{|etp| etp.pos_int!('e')}}
+        ptp.dig!(:pos_int, 'g', 'h')
+      end
+    end
+    e.all_errors.map{|err| err.keys}.must_equal [['a', 'c'], ['d', 0, 'f'], ['g', 'i']]
+    e.all_errors.map{|err| err.message}.must_equal ['unknown parameter: a[c]', 'unknown parameter: d[0][f]', 'unknown parameter: g[i]']
+
+    t = tp('a'=>{'b'=>'1'}, 'd'=>[{'e'=>'3'}], 'g'=>{'h'=>'5'})
+    t.convert!(unknown: :raise) do |ptp|
+      ptp.dig!(:pos_int, 'g', 'h')
+      ptp.convert!('a'){|stp| stp.pos_int!('b')}
+      ptp.convert!('d'){|dtp| dtp.convert_each!{|etp| etp.pos_int!('e')}}
+    end.must_equal('g'=>{'h'=>5}, 'a'=>{'b'=>1}, 'd'=>[{'e'=>3}])
+  end
+
+  it "should allow nested convert! to check only its own range with :unknown=>:raise" do
+    t = tp('a'=>{'b'=>'1', 'c'=>'2'}, 'd'=>'3')
+    e = error do
+      t.convert! do |ptp|
+        ptp.convert!('a', unknown: :raise){|stp| stp.pos_int!('b')}
+        ptp.str!('d')
+      end
+    end
+    e.reason.must_equal :unknown
+    e.keys.must_equal ['a', 'c']
+
+    # parameters reported by the inner scope are not reported again by the outer scope
+    t = tp('a'=>{'b'=>'1', 'c'=>'2'}, 'd'=>'3')
+    e = error do
+      t.convert!(unknown: :raise) do |ptp|
+        ptp.convert!('a', unknown: :raise){|stp| stp.pos_int!('b')}
+        ptp.str!('d')
+      end
+    end
+    e.param_names.must_equal ['a[c]']
+  end
+
+  it "#convert_each! with :unknown=>:raise should check only its own range" do
+    t = tp('d'=>[{'e'=>'3', 'f'=>'4'}], 'g'=>'5')
+    e = error do
+      t.convert! do |ptp|
+        ptp.convert!('d'){|dtp| dtp.convert_each!(unknown: :raise){|etp| etp.pos_int!('e')}}
+        ptp.str!('g')
+      end
+    end
+    e.reason.must_equal :unknown
+    e.keys.must_equal ['d', 0, 'f']
+  end
+
+  it "should handle :unknown=>:raise with subpaths traversing arrays, missing keys, and empty params" do
+    t = tp('d'=>[{'e'=>'3', 'f'=>'4'}])
+    e = error do
+      t.convert!(['d', 0], unknown: :raise){|ptp| ptp.pos_int!('e')}
+    end
+    e.keys.must_equal ['d', 0, 'f']
+
+    # missing subpath has no leaves to report
+    t = tp('a=1')
+    t.convert!('missing', raise: false, unknown: :raise){}.must_equal({})
+
+    # scalar value below subpath has no leaves to report
+    t = tp('a=1')
+    e = error do
+      t.convert!(['a', 'b'], raise: false, unknown: :raise){}
+    end
+    e.reason.must_equal :invalid_type
+
+    # empty params have no leaves to report
+    t = tp({})
+    t.convert!(unknown: :raise){}.must_equal({})
+  end
+
+  it "should raise the original error when convert_each! with :unknown=>:raise is used on an invalid object" do
+    t = tp('a=1')
+    e = error do
+      t.convert_each!(unknown: :raise){|ptp| ptp.str!('a')}
+    end
+    e.reason.must_equal :invalid_type
+  end
+
+  it "should use original string keys and array indexes in unknown errors even with :symbolize" do
+    t = tp('a'=>'1', 'b'=>{'c'=>'2'}, 'd'=>[{'e'=>'3'}])
+    e = error do
+      t.convert!(symbolize: true, unknown: :raise) do |ptp|
+        ptp.int!('a')
+      end
+    end
+    e.all_errors.map{|err| err.keys}.must_equal [['b', 'c'], ['d', 0, 'e']]
+  end
+
+  it "#unconsumed_params should report unconsumed leaf parameters" do
+    t = tp('a=1&b=2&c[d]=3')
+    t.unconsumed_params.must_be_nil
+    t.convert! do |ptp|
+      ptp.int!('a')
+      ptp.unconsumed_params.must_equal [['b'], ['c', 'd']]
+      ptp['c'].unconsumed_params.must_equal [['c', 'd']]
+    end
+    t.unconsumed_params.must_equal [['b'], ['c', 'd']]
+
+    # the next conversion scope starts with a fresh record
+    t.convert! do |ptp|
+      ptp.int!('b')
+    end
+    t.unconsumed_params.must_equal [['a'], ['c', 'd']]
+  end
+
+  it "should only accept parameters read by the executed branch, without leaking records across requests" do
+    convert = lambda do |t|
+      t.convert!(unknown: :raise) do |ptp|
+        case ptp.str!('action')
+        when 'create'
+          ptp.str!('name')
+        when 'update'
+          ptp.pos_int!('id')
+        end
+      end
+    end
+
+    convert.call(tp('action=create&name=x')).must_equal('action'=>'create', 'name'=>'x')
+    convert.call(tp('action=update&id=9')).must_equal('action'=>'update', 'id'=>9)
+
+    # parameters read only by the other branch are rejected
+    e = error{convert.call(tp('action=create&name=x&id=9'))}
+    e.param_names.must_equal ['id']
+    e = error{convert.call(tp('action=update&id=9&name=x'))}
+    e.param_names.must_equal ['name']
+
+    # a later request does not inherit the consumption record of a previous one
+    convert.call(tp('action=create&name=y')).must_equal('action'=>'create', 'name'=>'y')
+    convert.call(tp('action=update&id=8')).must_equal('action'=>'update', 'id'=>8)
+  end
+end
