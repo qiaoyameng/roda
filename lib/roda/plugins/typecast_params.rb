@@ -306,6 +306,72 @@ class Roda
     #
     # By design, typecast_params only deals with string keys, it is not possible to use
     # symbol keys as arguments to the conversion methods and have them converted.
+    #
+    # = Consumption Tracking
+    #
+    # Because the parameters used often depend on the request (such as a parameter
+    # specifying the action to take), a fixed list of allowed parameters cannot
+    # express which parameters a specific request actually used.  To handle this,
+    # typecast_params keeps a record of parameter consumption for each Params
+    # instance (i.e. per request), tracking which leaf parameters were consumed
+    # by conversion methods.  At the end of a conversion scope, you can report
+    # the parameters that were not consumed:
+    #
+    #   typecast_params.unconsumed_params # => [['c', 'd'], ['e', 0]]
+    #
+    # or reject the request if any parameters were not consumed:
+    #
+    #   typecast_params.check_consumed!
+    #
+    # +check_consumed!+ raises a TypecastParams::Error with reason +:unconsumed+
+    # if any leaf parameters were not consumed, with Error#all_errors containing
+    # an error for each unconsumed leaf (so Error#param_names works as usual).
+    # You can also use the +:check_consumed+ option to +convert!+ or
+    # +convert_each!+ to automatically check for unconsumed parameters when the
+    # conversion scope ends:
+    #
+    #   converted_params = typecast_params.convert!(check_consumed: true) do |tp|
+    #     case tp.str!('action')
+    #     when 'create'
+    #       tp.str!('name')
+    #     when 'update'
+    #       tp.pos_int!('id')
+    #     end
+    #   end
+    #
+    # With the +:check_consumed+ option, only the parameters read by the branch
+    # actually executed for the request are accepted, so a request for the
+    # +create+ action above can submit +action+ and +name+, but not +id+.
+    #
+    # Consumption is tracked at the leaf level:
+    #
+    # * Conversion methods (such as +pos_int+ or +array+) consume the parameter
+    #   they convert.  If the converted value is a hash or array, the entire
+    #   subtree below it is considered consumed.
+    # * Merely accessing a hash or array with #[] or #fetch does not consume the
+    #   parameters inside it, and #present? does not consume the parameters it
+    #   checks.
+    # * Parameters whose conversion fails are still considered consumed, so the
+    #   original conversion error is kept and the parameter is not also reported
+    #   as unconsumed.
+    # * Nested +convert!+, +convert_each!+, and +dig+ share the same consumption
+    #   record, keyed by the parameter path in the submitted parameters.  Calling
+    #   +unconsumed_params+ or +check_consumed!+ on a nested Params instance only
+    #   considers parameters below that instance, so inner scopes can check only
+    #   their own range.
+    # * Consumption paths always use the string keys and array indexes of the
+    #   submitted parameters, even when the +:symbolize+ option is used.
+    #
+    # You can explicitly mark a parameter subtree as consumed without converting
+    # it using +ignore!+:
+    #
+    #   typecast_params.ignore!('metadata')
+    #
+    # This consumes all parameters below the given key, including empty hashes
+    # and arrays, which have no leaf parameters of their own.
+    #
+    # The consumption record is reset for each request, it is not carried over
+    # between requests.
     module TypecastParams
       SCOPE_INSTANCE_VARIABLES = [:@_typecast_params, :@_typecast_query_params, :@_typecast_body_params].freeze
 
@@ -438,6 +504,40 @@ class Roda
 
         # Do not check max input bytesize
         def check_allowed_bytesize(v, max)
+        end
+      end
+
+      # Tracks which parameter leaf paths were consumed during conversion.
+      # A single tracker is shared by a root Params instance and all of its
+      # nested Params instances, so consumption is recorded per request (per
+      # root Params instance) and is not carried over between requests.
+      class ConsumptionTracker
+        # Record the given path (an array of string keys and/or integer
+        # indexes) as consumed.
+        def consume(path)
+          (@consumed ||= {})[path] = true
+        end
+
+        # Record the given path and all paths below it as consumed.  Used
+        # when a conversion consumes an entire hash or array value, and for
+        # explicit ignores, so that empty hashes and arrays (which have no
+        # leaf paths of their own) are also marked.
+        def consume_subtree(path)
+          (@subtrees ||= []) << path
+        end
+
+        # Whether the given path has been consumed, either directly or by
+        # the consumption of an enclosing subtree.
+        def consumed?(path)
+          if consumed = @consumed
+            return true if consumed[path]
+          end
+
+          if subtrees = @subtrees
+            subtrees.any?{|sub| path[0, sub.length] == sub}
+          else
+            false
+          end
         end
       end
 
@@ -599,6 +699,10 @@ class Roda
         # Set the object used for converting.  Conversion methods will convert members of
         # the passed object.
         def initialize(obj)
+          # Root Params instances (those without nesting) hold the consumption
+          # tracker shared by all nested Params instances.
+          @consumption_tracker = ConsumptionTracker.new unless @nesting
+
           case @obj = obj
           when Hash, Array
             # nothing
@@ -615,11 +719,13 @@ class Roda
         def present?(key)
           case key
           when String
-            !any(key).nil?
+            # Check the value directly instead of using any(), so that
+            # probing for a parameter does not consume it.
+            require_hash! ? !param_value(key).nil? : false
           when Array
             key.all? do |k|
               raise ProgrammerError, "non-String element in array argument passed to present?: #{k.inspect}" unless k.is_a?(String)
-              !any(k).nil?
+              present?(k)
             end
           else
             raise ProgrammerError, "unexpected argument passed to present?: #{key.inspect}"
@@ -655,7 +761,63 @@ class Roda
 
           @subs[key] = sub
           sub.sub_capture(@capture, @symbolize, @skip_missing)
+          sub.consumption_tracker = @consumption_tracker
           sub
+        end
+
+        # Mark the parameter subtree at the given key path as consumed without
+        # converting it.  This consumes all parameters below the given path,
+        # including empty hashes and arrays.  With no arguments, consumes the
+        # entire subtree of the current object.  Returns nil.
+        #
+        #   tp.ignore!('metadata')        # consume params['metadata'] and below
+        #   tp.ignore!('a', 'b')          # consume params['a']['b'] and below
+        #   tp['c'].ignore!               # consume params['c'] and below
+        def ignore!(*keys)
+          keys.each do |key|
+            unless key.is_a?(String) || key.is_a?(Integer)
+              raise ProgrammerError, "invalid key passed to ignore!: #{key.inspect}"
+            end
+          end
+
+          @consumption_tracker.consume_subtree(Array(@nesting) + keys) if @consumption_tracker
+          nil
+        end
+
+        # An array of paths for leaf parameters below the current object that
+        # have not been consumed by a conversion method or +ignore!+.  Each
+        # path is an array of the string keys and integer indexes used to
+        # access the parameter in the submitted parameters, regardless of any
+        # +:symbolize+ option used during conversion.  Empty hashes and arrays
+        # are treated as leaf parameters.
+        def unconsumed_params
+          leaves = _leaf_params(@obj, Array(@nesting))
+          if tracker = @consumption_tracker
+            leaves.reject!{|path| tracker.consumed?(path)}
+          end
+          leaves
+        end
+
+        # Raise a TypecastParams::Error with reason +:unconsumed+ if any leaf
+        # parameters below the current object have not been consumed.  The
+        # error's #all_errors contains an error for each unconsumed leaf
+        # parameter, so Error#param_names can be used to get the names of all
+        # unconsumed parameters.  Returns nil if all leaf parameters were
+        # consumed.
+        def check_consumed!
+          unconsumed = unconsumed_params
+          return nil if unconsumed.empty?
+
+          errors = unconsumed.map do |path|
+            e = Error.new("unconsumed parameter: #{_path_param_name(path)}")
+            e.keys = path
+            e.reason = :unconsumed
+            e
+          end
+
+          e = errors.first
+          e.all_errors = errors
+          raise e
         end
 
         # Return the nested value for key. If there is no nested_value for +key+,
@@ -674,17 +836,26 @@ class Roda
         #                  present in the params.
         # :symbolize :: Convert any string keys in the resulting hash and for any
         #               conversions below
+        # :check_consumed :: If set to true, after the block has been processed,
+        #                    raise a TypecastParams::Error if any leaf parameters
+        #                    below the converted object were not consumed (see
+        #                    #check_consumed!).
         def convert!(keys=nil, opts=OPTS)
           if keys.is_a?(Hash)
             opts = keys
             keys = nil
           end
 
-          _capture!(:nested_params, opts) do
+          sub = nil
+          converted = _capture!(:nested_params, opts) do
             if sub = subkey(Array(keys).dup, opts.fetch(:raise, true))
               yield sub
             end
           end
+
+          sub.check_consumed! if sub && opts[:check_consumed]
+
+          converted
         end
 
         # Runs conversions similar to convert! for each key specified by the :keys option.  If :keys option is not given
@@ -701,7 +872,7 @@ class Roda
         def convert_each!(opts=OPTS, &block)
           np = !@capture
 
-          _capture!(nil, opts) do
+          converted = _capture!(nil, opts) do
             case keys = opts[:keys]
             when nil
               keys = (0...@obj.length)
@@ -736,6 +907,10 @@ class Roda
               end
             end
           end
+
+          check_consumed! if opts[:check_consumed]
+
+          converted
         end
 
         # Convert values nested under the current obj.  Traverses the current object using +nest+, then converts
@@ -851,6 +1026,10 @@ class Roda
             @params = @obj.class.new
           end
         end
+
+        # Set the consumption tracker shared by all Params instances for the
+        # current request's parameters.  Called on subinstances created by #[].
+        attr_writer :consumption_tracker
         
         private
 
@@ -1052,6 +1231,7 @@ class Roda
         # If the value either before or after conversion is nil, return the +default+ value.
         def process(meth, key, default, type)
           orig_v = v = param_value(key)
+          _consume(key, v)
 
           if v.nil?
             if default == CHECK_NIL
@@ -1081,6 +1261,63 @@ class Roda
         # Get the value for the given key in the object.
         def param_value(key)
           @obj[key]
+        end
+
+        # Record the parameter at +key+ as consumed.  If the value at +key+ is
+        # a hash or array, the entire subtree below it is consumed, since the
+        # conversion hands the whole value to the caller.  Consumption is
+        # recorded before conversion, so parameters whose conversion fails are
+        # still considered consumed and are not also reported as unconsumed.
+        def _consume(key, v)
+          return unless tracker = @consumption_tracker
+
+          path = Array(@nesting) + [key]
+          if v.is_a?(Hash) || v.is_a?(Array)
+            tracker.consume_subtree(path)
+          else
+            tracker.consume(path)
+          end
+        end
+
+        # Recursively collect the paths of all leaf parameters in +obj+,
+        # prepending +path+ to each.  Empty hashes and arrays are treated as
+        # leaf parameters.  The returned paths use the string keys and integer
+        # indexes of the submitted parameters.
+        def _leaf_params(obj, path, leaves=[])
+          case obj
+          when Hash
+            if obj.empty?
+              leaves << path unless path.empty?
+            else
+              obj.each do |k, v|
+                _leaf_params(v, path + [k], leaves)
+              end
+            end
+          when Array
+            if obj.empty?
+              leaves << path unless path.empty?
+            else
+              obj.each_with_index do |v, i|
+                _leaf_params(v, path + [i], leaves)
+              end
+            end
+          else
+            leaves << path unless path.empty?
+          end
+
+          leaves
+        end
+
+        # Format a full parameter path (such as one returned by
+        # #unconsumed_params) as a parameter name, for use in exception
+        # messages.
+        def _path_param_name(path)
+          first, *rest = path
+          v = first.to_s.dup
+          rest.each do |param|
+            v << "[#{param}]"
+          end
+          v
         end
 
         # Helper for conversion methods where '' should be considered nil,

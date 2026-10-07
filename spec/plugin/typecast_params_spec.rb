@@ -1655,3 +1655,235 @@ describe "typecast_params plugin with strip: :all option" do
     @tp.call("a[]=1").any('a').must_equal ["1"]
   end
 end
+
+describe "typecast_params consumption tracking" do
+  def error
+    yield
+  rescue @tp_error => e
+    e
+  end
+
+  before do
+    res = nil
+    app(:typecast_params) do |r|
+      if r.env['rack.params']
+        r.define_singleton_method(:params){r.env['rack.params']}
+      end
+      res = typecast_params
+      nil
+    end
+
+    @tp = lambda do |params|
+      if params.is_a?(Hash)
+        req('rack.params'=>params)
+      else
+        req('QUERY_STRING'=>params, 'rack.input'=>rack_input)
+      end
+      res
+    end
+
+    @tp_error = Roda::RodaPlugins::TypecastParams::Error
+    @programmer_error = Roda::RodaPlugins::TypecastParams::ProgrammerError
+  end
+
+  it "#unconsumed_params should return paths for all leaf parameters initially" do
+    tp = @tp.call('a=1&b[]=2&c[d]=4')
+    tp.unconsumed_params.must_equal [['a'], ['b', 0], ['c', 'd']]
+  end
+
+  it "#unconsumed_params should treat empty hashes and arrays as leaf parameters" do
+    tp = @tp.call({'a'=>{}, 'b'=>[], 'c'=>{'d'=>'1'}})
+    tp.unconsumed_params.must_equal [['a'], ['b'], ['c', 'd']]
+  end
+
+  it "conversion methods should consume the converted parameter" do
+    tp = @tp.call('a=1&b[]=2&b[]=3&c[d]=4&c[e]=5&f=')
+    tp.pos_int!('a')
+    tp.unconsumed_params.must_equal [['b', 0], ['b', 1], ['c', 'd'], ['c', 'e'], ['f']]
+    tp.str!('f')
+    tp.unconsumed_params.must_equal [['b', 0], ['b', 1], ['c', 'd'], ['c', 'e']]
+  end
+
+  it "array conversion should consume the array entries" do
+    tp = @tp.call('a=1&b[]=2&b[]=3')
+    tp.array!(:pos_int, 'b')
+    tp.unconsumed_params.must_equal [['a']]
+  end
+
+  it "converting a hash or array value should consume the entire subtree" do
+    tp = @tp.call('c[d]=4&c[e]=5&f=6')
+    tp.Hash('c')
+    tp.unconsumed_params.must_equal [['f']]
+  end
+
+  it "#[] and #fetch should not consume the entries of the accessed container" do
+    tp = @tp.call('a=1&b[]=2&c[d]=4')
+    tp['b']
+    tp.fetch('c')
+    tp.unconsumed_params.must_equal [['a'], ['b', 0], ['c', 'd']]
+  end
+
+  it "#present? should not consume the probed parameters" do
+    tp = @tp.call('a=1&b[]=2')
+    tp.present?('a').must_equal true
+    tp.present?(%w'a b').must_equal true
+    tp.unconsumed_params.must_equal [['a'], ['b', 0]]
+  end
+
+  it "failed conversions should still consume the parameter and keep the original error" do
+    tp = @tp.call('a=x&c[d]=4')
+    e = error{tp.convert!(:check_consumed=>true){|c| c.pos_int!('a')}}
+    e.reason.must_equal :invalid_value
+    e.keys.must_equal ['a']
+    e.param_names.must_equal ['a']
+    tp.unconsumed_params.must_equal [['c', 'd']]
+  end
+
+  it "#dig should consume only the converted leaf, using the shared path identity" do
+    tp = @tp.call('c[d]=4&c[e]=5')
+    tp.dig!(:pos_int, 'c', 'd').must_equal 4
+    tp.unconsumed_params.must_equal [['c', 'e']]
+  end
+
+  it "#ignore! should consume the subtree, including empty containers" do
+    tp = @tp.call({'a'=>{}, 'b'=>[], 'c'=>{'d'=>'1'}, 'e'=>'2'})
+    tp.ignore!('a')
+    tp.ignore!('b')
+    tp.unconsumed_params.must_equal [['c', 'd'], ['e']]
+    tp['c'].ignore!
+    tp.unconsumed_params.must_equal [['e']]
+    tp.ignore!('e')
+    tp.unconsumed_params.must_equal []
+  end
+
+  it "#ignore! should raise a ProgrammerError for invalid keys" do
+    tp = @tp.call('a=1')
+    lambda{tp.ignore!(:a)}.must_raise @programmer_error
+    lambda{tp.ignore!('a', :b)}.must_raise @programmer_error
+  end
+
+  it "#check_consumed! should not raise if all leaf parameters were consumed" do
+    tp = @tp.call('a=1&c[d]=4')
+    tp.pos_int!('a')
+    tp['c'].pos_int!('d')
+    tp.check_consumed!.must_be_nil
+  end
+
+  it "#check_consumed! should raise an error for each unconsumed leaf parameter" do
+    tp = @tp.call('a=1&b[]=2&c[d]=4&c[e]=5')
+    tp.pos_int!('a')
+    e = error{tp.check_consumed!}
+    e.must_be_kind_of @tp_error
+    e.reason.must_equal :unconsumed
+    e.keys.must_equal ['b', 0]
+    e.param_names.must_equal ['b[]', 'c[d]', 'c[e]']
+    e.all_errors.length.must_equal 3
+  end
+
+  it "#check_consumed! on a nested params instance should only check its own scope" do
+    tp = @tp.call('a=1&c[d]=4&c[e]=5')
+    tp['c'].pos_int!('d')
+    e = error{tp['c'].check_consumed!}
+    e.keys.must_equal ['c', 'e']
+    e.param_names.must_equal ['c[e]']
+  end
+
+  it "#convert! with :check_consumed should raise for parameters not consumed inside the block" do
+    tp = @tp.call('a=1&c[d]=4&c[e]=5')
+    e = error do
+      tp.convert!(:check_consumed=>true) do |c|
+        c.pos_int!('a')
+      end
+    end
+    e.reason.must_equal :unconsumed
+    e.param_names.must_equal ['c[d]', 'c[e]']
+
+    tp = @tp.call('a=1')
+    tp.convert!(:check_consumed=>true){|c| c.pos_int!('a')}.must_equal('a'=>1)
+  end
+
+  it "nested #convert! with :check_consumed should only check its own scope" do
+    tp = @tp.call('a=1&c[d]=4&c[e]=5')
+    e = error do
+      tp.convert!('c', :check_consumed=>true) do |c|
+        c.pos_int!('d')
+      end
+    end
+    e.reason.must_equal :unconsumed
+    e.keys.must_equal ['c', 'e']
+    e.param_names.must_equal ['c[e]']
+  end
+
+  it "#convert_each! with :check_consumed should share the scope path identity with array indexes" do
+    tp = @tp.call({'m'=>[{'x'=>'1'}, {'x'=>'2', 'y'=>'3'}]})
+    e = error do
+      tp.convert!('m') do |m|
+        m.convert_each!(:check_consumed=>true) do |st|
+          st.pos_int!('x')
+        end
+      end
+    end
+    e.reason.must_equal :unconsumed
+    e.keys.must_equal ['m', 1, 'y']
+  end
+
+  it "nested #convert! and #convert_each! should share the consumption record of the enclosing scope" do
+    tp = @tp.call({'a'=>'1', 'c'=>{'d'=>'4'}, 'm'=>[{'x'=>'2'}]})
+    tp.convert!(:check_consumed=>true) do |c|
+      c.pos_int!('a')
+      c.convert!('c') do |sc|
+        sc.pos_int!('d')
+      end
+      c.convert!('m') do |mc|
+        mc.convert_each! do |st|
+          st.pos_int!('x')
+        end
+      end
+    end.must_equal('a'=>1, 'c'=>{'d'=>4}, 'm'=>[{'x'=>2}])
+  end
+
+  it "consumption paths should use the submitted string keys even with the :symbolize option" do
+    tp = @tp.call('a=1&c[d]=4')
+    e = error do
+      tp.convert!(:symbolize=>true, :check_consumed=>true) do |c|
+        c.pos_int!('a')
+      end
+    end
+    e.keys.must_equal ['c', 'd']
+    e.param_names.must_equal ['c[d]']
+
+    tp = @tp.call('a=1&c[d]=4')
+    tp.convert!(:symbolize=>true) do |c|
+      c.pos_int!('a')
+      c.convert!('c'){|sc| sc.pos_int!('d')}
+    end.must_equal(:a=>1, :c=>{:d=>4})
+    tp.unconsumed_params.must_equal []
+  end
+
+  it "should only accept parameters read by the executed action branch, without carrying the record over to the next request" do
+    convert = lambda do |tp|
+      tp.convert!(:check_consumed=>true) do |c|
+        case c.str!('action')
+        when 'create'
+          c.str!('name')
+        when 'update'
+          c.pos_int!('id')
+        end
+      end
+    end
+
+    convert.call(@tp.call({'action'=>'create', 'name'=>'a'})).must_equal('action'=>'create', 'name'=>'a')
+    convert.call(@tp.call({'action'=>'update', 'id'=>'1'})).must_equal('action'=>'update', 'id'=>1)
+
+    # the create branch does not read id, so it is rejected for this request
+    e = error{convert.call(@tp.call({'action'=>'create', 'name'=>'a', 'id'=>'1'}))}
+    e.reason.must_equal :unconsumed
+    e.param_names.must_equal ['id']
+
+    # name was consumed by previous requests, but the record is not carried
+    # over, so it is rejected for this update request
+    e = error{convert.call(@tp.call({'action'=>'update', 'id'=>'1', 'name'=>'a'}))}
+    e.reason.must_equal :unconsumed
+    e.param_names.must_equal ['name']
+  end
+end
