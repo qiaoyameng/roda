@@ -169,11 +169,65 @@ class Roda
     # the strings are stored lowercase in a hash.  Matching on regexps provided to the
     # +rcpt+ class method is an O(n) operation on the number of regexps.
     #
-    # If you would like to break up the routing tree using something other than the
-    # recipient address, you can use the multi_route plugin.
-    #
-    # = Hooks
-    #
+   # If you would like to break up the routing tree using something other than the
+   # recipient address, you can use the multi_route plugin.
+   #
+   # = Envelope Processing
+   #
+   # When a single message is delivered to more than one mailbox, the same Mail
+   # instance may have multiple SMTP envelope recipients.  Because +process_mail+
+   # determines recipients from the message itself (To and CC headers by
+   # default) and returns after the first matching +rcpt+ route, it is not
+   # suitable for processing a message independently for each envelope
+   # recipient.  For that, use +process_mail_envelope+, passing the Mail
+   # instance and the explicit envelope recipient addresses:
+   #
+   #   results = MailProcessor.process_mail_envelope(mail, envelope_recipients)
+   #   results.each do |result|
+   #     result.recipient   # the envelope recipient address
+   #     result.request     # the Roda request used while routing for it
+   #     result.handled?    # r.handle was called for the recipient
+   #     result.unhandled?  # no r.handle call and no exception
+   #     result.failed?     # an exception was raised, available as result.error
+   #   end
+   #
+   # Only the given envelope addresses are used for recipient-based routing (the
+   # class-level +rcpt+ routes and the +r.rcpt+ matcher).  The To and CC headers
+   # are not modified and remain available to the routes via +mail.to+ and
+   # +mail.cc+, but they are not used to supplement the envelope recipients, so
+   # they cannot reveal envelope-only recipients such as BCC addresses.
+   #
+   # Each recipient is processed with its own Roda scope and request, so request
+   # captures and the handled flag are independent per recipient.  Duplicate
+   # recipients are processed once.  By default, duplicate detection keeps the
+   # case-sensitive local part of the address and compares only the domain part
+   # case insensitively (so +Foo@example.com+ and +foo@example.com+ are distinct,
+   # but +foo@Example.com+ and +foo@example.com+ are not).  Use the +rcpt_key+
+   # class method, or the +:rcpt_key+ option to +process_mail_envelope+, to
+   # provide a callable returning the comparison key for an address.
+   #
+   # By default a failure for one recipient does not prevent the remaining
+   # recipients from being processed.  Pass <tt>on_error: :stop</tt> to stop at
+   # the first failure, or provide a callable that receives the failing
+   # EnvelopeResult and returns +:continue+ or +:stop+.  The returned results
+   # are in the order of the given envelope recipients (with duplicates
+   # removed), regardless of failures.
+   #
+   # The +handled_mail+, +unhandled_mail+, and +after_mail+ hooks are invoked
+   # for each recipient individually, nested inside that recipient's processing,
+   # in the same order as +process_mail+: +handled_mail+ or +unhandled_mail+
+   # first (neither runs when routing raises a non-UnhandledMail exception),
+   # and +after_mail+ last via +ensure+.  A hook is therefore never invoked more
+   # than once for the same recipient.  The default +unhandled_mail+ hook
+   # reraises the UnhandledMail exception, but in envelope processing that
+   # leaves the recipient unhandled rather than failed, so that one message can
+   # be handled for some recipients and unhandled for others.
+   #
+   # The message itself is not changed, so the same Mail instance can still be
+   # passed to +process_mail+ for the standard single-pass processing.
+   #
+   # = Hooks
+   #
     # The mail_processor plugin offers hooks for processing mail.
     #
     # For mail that is handled successfully, you can use the handled_mail hook:
@@ -284,6 +338,58 @@ class Roda
       # call to +unhandled_mail+.
       class UnhandledMail < StandardError; end
 
+      # The result of processing a single envelope recipient when using
+      # the +process_mail_envelope+ entry point.  Each recipient gets its own
+      # result object, so the +request+, +captures+, and +handled?+ values are
+      # independent per recipient.
+      class EnvelopeResult
+        # The envelope recipient address this result is for, in the form it was
+        # provided to +process_mail_envelope+.
+        attr_reader :recipient
+
+        # The Roda request used when routing for this recipient.  This is a separate
+        # request object for each recipient, so request captures do not leak between
+        # recipients.
+        attr_reader :request
+
+        # The exception that caused processing of this recipient to fail, if any.
+        # This is nil for handled and unhandled recipients.
+        attr_reader :error
+
+        def initialize(recipient, request) # :nodoc:
+          @recipient = recipient
+          @request = request
+          @error = nil
+        end
+
+        # Set the exception that caused this recipient to fail.  The first
+        # exception encountered is retained, even if the +after_mail+ hook also
+        # raises.
+        def fail!(error) # :nodoc:
+          @error ||= error
+          self
+        end
+
+        # Whether routing for the recipient called +r.handle+, marking the
+        # recipient as handled.
+        def handled?
+          request.env['roda.mail_handled'] == true
+        end
+
+        # Whether routing for the recipient failed because an exception other
+        # than UnhandledMail was raised (during routing, or by one of the
+        # +handled_mail+/+after_mail+ hooks).
+        def failed?
+          !@error.nil?
+        end
+
+        # Whether routing for the recipient did not call +r.handle+ and no
+        # other exception was raised.
+        def unhandled?
+          @error.nil? && !handled?
+        end
+      end
+
       module ClassMethods
         RodaPlugins.opt_attr_reader(self, :mail_processor_string_routes)
         RodaPlugins.opt_attr_reader(self, :mail_processor_regexp_routes)
@@ -300,7 +406,7 @@ class Roda
         # Process the given Mail instance, calling the appropriate hooks depending on
         # whether the mail was handled during processing.
         def process_mail(mail)
-          scope = new("PATH_INFO"=>'', 'SCRIPT_NAME'=>'', "REQUEST_METHOD"=>"PROCESSMAIL", 'rack.input'=>StringIO.new, 'roda.mail'=>mail)
+          scope = new(_mail_processor_env(mail))
 
           begin
             begin
@@ -313,6 +419,149 @@ class Roda
           ensure
             scope.after_mail_hook
           end
+        end
+
+        # Process the given Mail instance once for each of the given envelope
+        # recipients.  Unlike +process_mail+, which uses the mail recipients
+        # (To and CC headers by default) and stops at the first +rcpt+ route
+        # that matches, +process_mail_envelope+ routes the message separately
+        # for every explicit envelope recipient address.
+        #
+        # The envelope recipients are used for all recipient-based routing (the
+        # class-level +rcpt+ routes and the +r.rcpt+ matcher).  The To and CC
+        # headers are left untouched in the message and remain available via
+        # +mail.to+ and +mail.cc+, but they are not consulted to add recipients,
+        # so recipients that only appear in the envelope (such as BCC recipients)
+        # are not exposed through the headers.
+        #
+        # Returns an array of EnvelopeResult objects, one for each unique
+        # recipient, in the order the recipients were given (duplicate
+        # recipients are processed once).  Each result is independently handled,
+        # unhandled, or failed:
+        #
+        #   results = MailProcessor.process_mail_envelope(mail, recipients)
+        #   results.each do |result|
+        #     case
+        #     when result.handled?
+        #       # routing called r.handle for result.recipient
+        #     when result.failed?
+        #       # result.error is the exception raised while processing recipient
+        #     when result.unhandled?
+        #       # no r.handle call and no exception for result.recipient
+        #     end
+        #   end
+        #
+        # Each recipient is routed using a separate Roda scope and request, and
+        # the +handled_mail+, +unhandled_mail+, and +after_mail+ hooks are called
+        # separately for each recipient, inside the processing of that recipient.
+        # For a single recipient the hooks are therefore called at most once, in
+        # the same order as +process_mail+: +handled_mail+ or +unhandled_mail+
+        # first (neither is called if routing raises a non-UnhandledMail
+       # exception), then +after_mail+ in an +ensure+.  An exception raised by
+       # the +unhandled_mail+ hook when it is the default hook (which reraises
+       # the UnhandledMail exception) leaves the recipient unhandled (with no
+       # EnvelopeResult#error); an exception raised by a custom +unhandled_mail+
+       # hook, or by any other hook or by routing, marks the recipient as failed.
+        #
+        # By default, if processing a recipient fails, the remaining recipients
+        # are still processed.  Pass <tt>on_error: :stop</tt> to stop processing
+        # remaining recipients after the first failure:
+        #
+        #   MailProcessor.process_mail_envelope(mail, recipients, on_error: :stop)
+        #
+        # A callable can also be provided, which is called with the failing
+        # EnvelopeResult and should return +:continue+ or +:stop+ to determine
+        # whether to process the remaining recipients:
+        #
+        #   MailProcessor.process_mail_envelope(mail, recipients,
+        #     on_error: ->(result) { result.error.is_a?(RetryableError) ? :continue : :stop })
+        #
+        # Duplicate recipients are compared by key.  The default key keeps the
+        # case-sensitive local part of the address and only lowercases the domain
+        # part, so +Foo@example.com+ and +foo@example.com+ are treated as
+        # different recipients, while +foo@Example.com+ and +foo@example.com+
+        # are treated as the same.  This key is also used to look up string
+        # +rcpt+ routes.  Pass a custom +:rcpt_key+ callable taking the address
+        # and returning the comparison key to override this per call:
+        #
+        #   MailProcessor.process_mail_envelope(mail, recipients,
+        #     rcpt_key: ->(address) { address.to_s.downcase })
+        #
+        # Alternatively, the +rcpt_key+ class method can be used to set the
+        # comparison key for all calls.
+        def process_mail_envelope(mail, recipients, on_error: :continue, rcpt_key: nil)
+          unless on_error.is_a?(Symbol) || on_error.respond_to?(:call)
+            raise RodaError, "invalid value for :on_error option, should be :continue, :stop, or a callable"
+          end
+
+          routing_scope = new(_mail_processor_env(mail))
+          key_callable = rcpt_key || routing_scope.method(:mail_rcpt_key)
+          default_unhandled_hook = routing_scope.method(:unhandled_mail_hook).owner == InstanceMethods
+
+          keyed_string_routes = nil
+          if string_routes = mail_processor_string_routes
+            keyed_string_routes = {}
+            string_routes.each do |route_address, meth|
+              keyed_string_routes[key_callable.call(route_address)] = meth
+            end
+          end
+
+          results = []
+          seen = {}
+
+          Array(recipients).each do |recipient|
+            address = recipient.to_s
+            key = key_callable.call(address)
+            next if seen.key?(key)
+            seen[key] = true
+
+            scope = new(_mail_processor_env(mail, address))
+            result = EnvelopeResult.new(recipient, scope.request)
+            results << result
+
+            begin
+              begin
+                scope.process_mail_recipient(address, key, keyed_string_routes)
+              rescue UnhandledMail => unhandled
+                begin
+                  scope.unhandled_mail_hook
+                rescue => hook_error
+                  # The default unhandled_mail hook just reraises the
+                  # UnhandledMail, which represents an unhandled recipient,
+                  # not a failure.  Exceptions from custom unhandled_mail
+                  # hooks, like all other hook exceptions, mark a failure.
+                  unless default_unhandled_hook && hook_error.equal?(unhandled)
+                    result.fail!(hook_error)
+                  end
+                end
+              rescue => error
+                result.fail!(error)
+              else
+                begin
+                  scope.handled_mail_hook
+                rescue => hook_error
+                  result.fail!(hook_error)
+                end
+              end
+            ensure
+              begin
+                scope.after_mail_hook
+              rescue => hook_error
+                result.fail!(hook_error)
+              end
+            end
+
+            if result.failed?
+              action = on_error.respond_to?(:call) ? on_error.call(result) : on_error
+              if action == :stop
+                break
+              elsif action != :continue
+                raise RodaError, "invalid return value from :on_error callable, should be :continue or :stop"
+              end
+            end
+          end
+
+          results
         end
         
         # Process all mail in the given mailbox.  If the +:retriever+ option is
@@ -370,6 +619,28 @@ class Roda
             end
           END
         end
+
+        # Set the block used to determine the comparison key for recipient
+        # addresses, used when deduplicating envelope recipients and when
+        # looking up string +rcpt+ routes during envelope processing.  The
+        # block is called with a recipient address and should return the key
+        # used for comparison.  By default the local part is preserved as given
+        # (case sensitive) and the domain part is lowercased.
+        def rcpt_key(&block)
+          define_method(:mail_rcpt_key, &block)
+          nil
+        end
+
+        private
+
+        # Build the Rack environment used to process a mail.  If an envelope
+        # recipient address is given, it is stored so recipient routing uses the
+        # envelope address instead of the To and CC headers.
+        def _mail_processor_env(mail, recipient=nil)
+          env = {"PATH_INFO"=>'', "SCRIPT_NAME"=>'', "REQUEST_METHOD"=>"PROCESSMAIL", 'rack.input'=>StringIO.new, 'roda.mail'=>mail}
+          env['roda.mail_recipient'] = recipient if recipient
+          env
+        end
       end
 
       module InstanceMethods
@@ -410,6 +681,42 @@ class Roda
           nil
         end
 
+        # Perform the processing of mail for a single explicit envelope
+        # recipient, first considering routes defined via the class-level
+        # +rcpt+ method (looking up string routes by the given comparison key
+        # and regexp routes against the given recipient address), and then the
+        # normal routing tree passed in as the block.  This is used by
+        # +process_mail_envelope+ so each recipient is routed independently.
+        def process_mail_recipient(address, key, keyed_string_routes=nil)
+          matched = false
+
+          if keyed_string_routes
+            if meth = keyed_string_routes[key]
+              _roda_handle_route{send(meth, @_request)}
+              matched = true
+            end
+          end
+
+          unless matched
+            if regexp_routes = self.class.mail_processor_regexp_routes
+              regexp_routes.each do |regexp, meth|
+                if md = regexp.match(address)
+                  @_request.captures.concat(md.captures)
+                  _roda_handle_route{send(meth, @_request, *md.captures)}
+                  matched = true
+                  break
+                end
+              end
+            end
+          end
+
+          unless matched
+            _roda_handle_main_route
+          end
+
+          nil
+        end
+
         # Hook called after processing any mail, whether the mail was
         # handled or not.  Does nothing by default.
         def after_mail_hook
@@ -441,9 +748,28 @@ class Roda
         end
 
         # The recipients of the mail instance being processed, uses the To and CC
-        # headers by default.
+        # headers by default.  When processing a specific envelope recipient via
+        # +process_mail_envelope+, only that envelope recipient address is
+        # returned; the To and CC headers are not used to add recipients.
         def mail_recipients
+          return [env['roda.mail_recipient']] if env.key?('roda.mail_recipient')
           Array(to) + Array(cc)
+        end
+
+        # The comparison key for a recipient address, used to deduplicate
+        # envelope recipients and to look up string +rcpt+ routes during
+        # envelope processing.  By default, the local part of the address is
+        # kept as given (case sensitive) and the domain part is lowercased,
+        # since the domain part of an email address is case insensitive while
+        # the local part is case sensitive.  Can be overridden via the
+        # +rcpt_key+ class method.
+        def mail_rcpt_key(address)
+          address = address.to_s
+          if idx = address.rindex('@')
+            address[0, idx+1] + address[(idx+1)...address.length].downcase
+          else
+            address
+          end
         end
 
         # Raise an UnhandledMail exception with the given reason, used to mark the
@@ -629,4 +955,3 @@ class Roda
     register_plugin(:mail_processor, MailProcessor)
   end
 end
-

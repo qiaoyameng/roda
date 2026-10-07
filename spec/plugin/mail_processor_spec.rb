@@ -449,5 +449,306 @@ describe "mail_processor plugin" do
     check{app.process_mail(new_mail)}.must_equal [1, 3, 2, 4, 6]
     check{app.process_mail(new_mail{|m| m.to 'x@example.com'})}.must_equal [1, 3, 2, 5, 6]
   end
+
+  it "supports process_mail_envelope processing each envelope recipient independently in envelope order" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+      r.handle_rcpt(/ticket\+(\d+)/) do |ticket_id|
+        processed << [:main, ticket_id]
+      end
+    end
+    app.rcpt(/ticket\+(\d+)@example\.com/) do |r, ticket_id|
+      r.handle do
+        processed << [:ticket, ticket_id]
+      end
+    end
+    app.rcpt('boom@example.com') do |r|
+      raise "boom failure"
+    end
+
+    mail = new_mail do |m|
+      m.to 'archive@example.com'
+      m.cc []
+    end
+    recipients = ['ticket+1@example.com', 'ticket+2@example.com', 'boom@example.com', 'unknown@example.com']
+
+    results = app.process_mail_envelope(mail, recipients)
+
+    results.map(&:recipient).must_equal recipients
+    results.map(&:handled?).must_equal [true, true, false, false]
+    results.map(&:failed?).must_equal [false, false, true, false]
+    results.map(&:unhandled?).must_equal [false, false, false, true]
+    results[0].request.must_be_kind_of Roda::RodaRequest
+    results[0].request.wont_be_same_as results[1].request
+    results[2].error.message.must_equal "boom failure"
+    results[3].error.must_be_nil
+
+    processed.must_equal [[:ticket, "1"], [:ticket, "2"]]
+
+    # To/Cc headers stay as mail headers, they do not add envelope recipients
+    mail.to.map(&:to_s).must_equal ['archive@example.com']
+    results.map(&:recipient).wont_include 'archive@example.com'
+
+    # A message can still be processed through the original single-pass entry point
+    processed.clear
+    single = new_mail do |m|
+      m.to 'ticket+9@other.com'
+      m.cc []
+    end
+    app.process_mail(single)
+    processed.must_equal [[:main, "9"]]
+  end
+
+  it "uses envelope recipients for rcpt routing without exposing hidden recipients via To/Cc" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+      r.handle_to('shown@example.com') do
+        processed << :to_shown
+      end
+      r.handle do
+        processed << :main_fallback
+      end
+    end
+    app.rcpt('hidden@example.com') do |r|
+      r.handle do
+        processed << :hidden
+      end
+    end
+
+    mail = new_mail do |m|
+      m.to 'shown@example.com'
+      m.cc []
+    end
+
+    # The envelope-only address is routed, even though it appears in no header
+    results = app.process_mail_envelope(mail, ['shown@example.com', 'hidden@example.com'])
+    results.map(&:handled?).must_equal [true, true]
+    processed.must_equal [:to_shown, :hidden]
+
+    # r.rcpt inside the main route also sees only the current envelope recipient
+    processed.clear
+    app2 = Class.new(Roda)
+    app2.plugin :mail_processor
+    app2.route do |r|
+      r.handle_rcpt('hidden@example.com') do
+        processed << :rcpt_hidden
+      end
+    end
+    results = app2.process_mail_envelope(mail, ['hidden@example.com', 'shown@example.com'])
+    results.map(&:handled?).must_equal [true, false]
+    processed.must_equal [:rcpt_hidden]
+  end
+
+  it "keeps request captures independent for each envelope recipient" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+    end
+    app.rcpt(/ticket\+(\d+)@(example)\.com/) do |r, ticket_id, domain|
+      r.handle do
+        processed << [ticket_id, domain]
+      end
+    end
+
+    mail = new_mail
+    results = app.process_mail_envelope(mail, ['ticket+10@example.com', 'ticket+20@example.com'])
+
+    results[0].request.captures.must_equal ['10', 'example']
+    results[1].request.captures.must_equal ['20', 'example']
+    processed.must_equal [['10', 'example'], ['20', 'example']]
+  end
+
+  it "calls hooks once per recipient, nested inside that recipient's processing" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+    end
+    app.rcpt('ok@example.com') do |r|
+      r.handle { processed << :route_ok }
+    end
+    app.rcpt('boom@example.com') do |r|
+      raise "route failure"
+    end
+    app.handled_mail do
+      processed << [:handled, mail_recipients]
+    end
+    app.unhandled_mail do
+      processed << [:unhandled, mail_recipients]
+    end
+    app.after_mail do
+      processed << [:after, mail_recipients]
+    end
+
+    mail = new_mail
+    results = app.process_mail_envelope(mail, ['ok@example.com', 'boom@example.com', 'missing@example.com'])
+
+    results.map(&:handled?).must_equal [true, false, false]
+    results.map(&:failed?).must_equal [false, true, false]
+    results.map(&:unhandled?).must_equal [false, false, true]
+
+    # handled hook and after hook for the handled recipient
+    processed.must_include :route_ok
+    processed.must_include [:handled, ['ok@example.com']]
+    # no handled/unhandled hook for the routing failure, but after_mail still runs
+    processed.wont_include [:handled, ['boom@example.com']]
+    processed.wont_include [:unhandled, ['boom@example.com']]
+    processed.must_include [:after, ['boom@example.com']]
+    # unhandled hook and after hook for the unhandled recipient
+    processed.must_include [:unhandled, ['missing@example.com']]
+    processed.must_include [:after, ['missing@example.com']]
+
+    # exactly one hook call of each kind per recipient
+    processed.count([:after, ['ok@example.com']]).must_equal 1
+    processed.count([:after, ['boom@example.com']]).must_equal 1
+    processed.count([:after, ['missing@example.com']]).must_equal 1
+    processed.count([:handled, ['ok@example.com']]).must_equal 1
+    processed.count([:unhandled, ['missing@example.com']]).must_equal 1
+  end
+
+  it "leaves recipients unhandled, not failed, with the default unhandled_mail hook" do
+    app(:mail_processor) do |r|
+      r.handle_rcpt('ok@example.com') {}
+    end
+    mail = new_mail
+    results = app.process_mail_envelope(mail, ['ok@example.com', 'missing@example.com'])
+
+    results[0].handled?.must_equal true
+    results[1].unhandled?.must_equal true
+    results[1].failed?.must_equal false
+    results[1].error.must_be_nil
+  end
+
+  it "supports on_error: :stop to stop processing remaining recipients after a failure" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+    end
+    app.rcpt('boom@example.com') do |r|
+      raise "boom"
+    end
+    app.rcpt('after@example.com') do |r|
+      r.handle { processed << :after }
+    end
+
+    mail = new_mail
+    results = app.process_mail_envelope(mail, ['boom@example.com', 'after@example.com'], on_error: :stop)
+
+    results.map(&:recipient).must_equal ['boom@example.com']
+    results.first.failed?.must_equal true
+    processed.must_equal []
+  end
+
+  it "continues after a failure by default and supports an on_error callable policy" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+    end
+    app.rcpt('boom@example.com') do |r|
+      raise StandardError, "boom"
+    end
+    app.rcpt('other@example.com') do |r|
+      r.handle { processed << :other }
+    end
+
+    mail = new_mail
+
+    results = app.process_mail_envelope(mail, ['boom@example.com', 'other@example.com'])
+    results.map(&:recipient).must_equal ['boom@example.com', 'other@example.com']
+    processed.must_equal [:other]
+
+    processed.clear
+    failed = []
+    results = app.process_mail_envelope(mail, ['boom@example.com', 'other@example.com'],
+      on_error: ->(result) { failed << result.recipient; :continue })
+    results.map(&:recipient).must_equal ['boom@example.com', 'other@example.com']
+    failed.must_equal ['boom@example.com']
+    processed.must_equal [:other]
+
+    processed.clear
+    results = app.process_mail_envelope(mail, ['boom@example.com', 'other@example.com'],
+      on_error: ->(result) { :stop })
+    results.map(&:recipient).must_equal ['boom@example.com']
+    processed.must_equal []
+
+    proc do
+      app.process_mail_envelope(mail, ['boom@example.com'], on_error: :bogus)
+    end.must_raise Roda::RodaError
+
+    proc do
+      app.process_mail_envelope(mail, ['boom@example.com'], on_error: Object.new)
+    end.must_raise Roda::RodaError
+  end
+
+  it "deduplicates envelope recipients by case-sensitive local part and case-insensitive domain by default" do
+    app(:mail_processor) do |r|
+    end
+    app.rcpt('Foo@example.com') do |r|
+      r.handle {}
+    end
+
+    mail = new_mail
+
+    # Domain case does not matter, local part case does
+    results = app.process_mail_envelope(mail, ['Foo@example.com', 'Foo@Example.com', 'foo@example.com', 'foo@EXAMPLE.com'])
+    results.map(&:recipient).must_equal ['Foo@example.com', 'foo@example.com']
+    results.map(&:handled?).must_equal [true, false]
+  end
+
+  it "allows overriding the recipient comparison key via rcpt_key option and class method" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+    end
+    app.rcpt('bar@example.com') do |r|
+      r.handle { processed << :bar }
+    end
+
+    mail = new_mail
+
+    # Fully case-insensitive comparison via per-call key
+    results = app.process_mail_envelope(mail, ['BAR@EXAMPLE.COM', 'bar@example.com'],
+      rcpt_key: ->(address) { address.to_s.downcase })
+    results.map(&:recipient).must_equal ['BAR@EXAMPLE.COM']
+    results.map(&:handled?).must_equal [true]
+
+    # Class-level rcpt_key
+    app2 = Class.new(Roda)
+    app2.plugin :mail_processor
+    app2.rcpt_key { |address| address.to_s.downcase }
+    app2.route do |r|
+    end
+    app2.rcpt('bar@example.com') do |r|
+      r.handle { processed << :bar2 }
+    end
+    results = app2.process_mail_envelope(mail, ['BAR@EXAMPLE.COM', 'Bar@Example.com'])
+    results.map(&:recipient).must_equal ['BAR@EXAMPLE.COM']
+    results.first.handled?.must_equal true
+  end
+
+  it "returns independent handled flags when one recipient handles and another does not in the same route" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+      r.handle_rcpt('a@example.com') do
+        processed << :a
+      end
+    end
+    mail = new_mail
+    results = app.process_mail_envelope(mail, ['a@example.com', 'b@example.com'])
+
+    results.map(&:handled?).must_equal [true, false]
+    results.map(&:unhandled?).must_equal [false, true]
+    processed.must_equal [:a]
+  end
+
+  it "supports process_mail_envelope when the application is frozen" do
+    @processed = processed = []
+    app(:mail_processor) do |r|
+    end
+    app.rcpt('a@example.com') do |r|
+      r.handle { processed << :a }
+    end
+    app.freeze
+
+    mail = new_mail
+    results = app.process_mail_envelope(mail, ['a@example.com', 'b@example.com'])
+    results.map(&:handled?).must_equal [true, false]
+    results.map(&:unhandled?).must_equal [false, true]
+    processed.must_equal [:a]
+  end
 end
 end
